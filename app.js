@@ -32,7 +32,7 @@ const PLATFORM_CONFIG = {
     label: 'Instagram',
     icon: 'fa-brands fa-instagram',
     iconClass: 'instagram',
-    method: 'HTML Open Graph / Meta scrape (server-side)',
+    method: 'Instagram oEmbed (direct)',
     domains: ['instagram.com'],
     color: '#c13584'
   },
@@ -481,8 +481,57 @@ const API_BASE = '';   // e.g. 'https://ai-marketing-tools.vercel.app'
 
 /* ═══════════════════════════════════════════════════════
    DIRECT oEMBED EXTRACTION (no backend needed)
-   Works in-browser for TikTok and YouTube.
+   Works in-browser for Instagram, TikTok, and YouTube.
+   Uses each platform's public oEmbed endpoint — CORS-enabled,
+   no API token required.
    ═══════════════════════════════════════════════════════ */
+
+async function extractInstagramDirect(url) {
+  // Strip tracking params — keep only the shortcode path
+  const clean = url.split('?')[0].replace(/\/$/, '');
+  const endpoint = `https://www.instagram.com/api/v1/oembed/?url=${encodeURIComponent(clean)}&omitscript=true`;
+
+  const res = await fetch(endpoint);
+  if (!res.ok) throw new Error(`Instagram oEmbed returned ${res.status} — the post may be private or deleted.`);
+
+  const d = await res.json();
+
+  // Extract hashtags from caption title
+  const caption  = d.title || '';
+  const hashtags = [...new Set((caption.match(/#\w+/g) || []))];
+
+  // Derive shortcode from URL for permalink
+  const shortcodeMatch = url.match(/\/p\/([A-Za-z0-9_-]+)/)  ||
+                         url.match(/\/reel\/([A-Za-z0-9_-]+)/) ||
+                         url.match(/\/tv\/([A-Za-z0-9_-]+)/);
+  const shortcode = shortcodeMatch ? shortcodeMatch[1] : null;
+  const permalink = shortcode ? `https://www.instagram.com/p/${shortcode}/` : clean;
+
+  return {
+    version: '1.0',
+    source: { url: permalink, platform: 'instagram', extractor: 'oembed-direct' },
+    clientProfile: {
+      username:    d.author_name || '',
+      profileName: d.author_name || '',
+      profileUrl:  d.author_url  || `https://www.instagram.com/${d.author_name || ''}`,
+      profileImage: null,
+      avatarUrl:   null
+    },
+    postContent: {
+      caption,
+      hashtags,
+      postType:  'post',
+      timestamp: null
+    },
+    mediaAssets: {
+      videoThumbnail: d.thumbnail_url || null,
+      postImages:     d.thumbnail_url ? [{ url: d.thumbnail_url, width: d.thumbnail_width, height: d.thumbnail_height }] : [],
+      carouselAssets: []
+    },
+    engagementMetrics: { likes: null, comments: null, shares: null, views: null },
+    rawOembed: d
+  };
+}
 
 async function extractTikTokDirect(url) {
   const endpoint = `https://www.tiktok.com/oembed?url=${encodeURIComponent(url)}`;
@@ -554,7 +603,11 @@ async function extractYouTubeDirect(url) {
 async function extractPost(url) {
   const platform = detectPlatformFromUrl(url);
 
-  // ── Direct extraction (no backend) for supported platforms ────────
+  // ── Direct extraction (no backend needed) ───────────────────────
+  if (platform === 'instagram') {
+    log('info', 'Using direct Instagram oEmbed (no backend needed)');
+    return await extractInstagramDirect(url);
+  }
   if (platform === 'tiktok') {
     log('info', 'Using direct TikTok oEmbed (no backend needed)');
     return await extractTikTokDirect(url);
@@ -564,15 +617,14 @@ async function extractPost(url) {
     return await extractYouTubeDirect(url);
   }
 
-  // ── All other platforms require the backend ───────────────────────
+  // ── Facebook and other platforms require the backend ─────────────
   const apiUrl = (API_BASE ? API_BASE.replace(/\/$/, '') : '') + '/api/extract';
-
-  // Detect if we're on GitHub Pages (no backend available)
   const isGitHubPages = window.location.hostname.endsWith('.github.io');
+
   if (isGitHubPages && !API_BASE) {
     throw new Error(
-      `Instagram and Facebook extraction requires the backend API. ` +
-      `Set API_BASE in app.js to your Vercel URL, or test with a TikTok or YouTube link instead.`
+      `Facebook extraction requires the backend API. ` +
+      `Set API_BASE in app.js to your Vercel URL to enable Facebook support.`
     );
   }
 
@@ -637,8 +689,8 @@ dom.form.addEventListener('submit', async event => {
   dom.btnLabel.classList.add('hidden');
   dom.btnLoading.classList.remove('hidden');
   const platform = detectPlatformFromUrl(url);
-  const usesDirect = platform === 'tiktok' || platform === 'youtube';
-  setStatus(usesDirect ? 'Fetching via oEmbed…' : 'Connecting to extraction API…', 'loading');
+  const usesDirect = platform === 'tiktok' || platform === 'youtube' || platform === 'instagram';
+  setStatus(usesDirect ? `Fetching from ${PLATFORM_CONFIG[platform]?.label || platform} oEmbed…` : 'Connecting to extraction API…', 'loading');
   log('info', 'Extraction started', { url });
 
   try {
@@ -1423,13 +1475,14 @@ async function init() {
     } else if (isGHPages) {
       // GitHub Pages — no backend, limited to TikTok + YouTube
       banner.className = 'backend-banner warn';
-      banner.innerHTML = `<i class="fa-solid fa-triangle-exclamation"></i>
+      banner.innerHTML = `<i class="fa-solid fa-circle-info"></i>
         <span>
-          <strong>TikTok &amp; YouTube work now</strong> (direct oEmbed, no backend needed).<br>
-          <strong>Instagram &amp; Facebook</strong> require the backend API — 
-          <a href="https://github.com/akmalhalim22/AI-marketing-tools" target="_blank" rel="noopener">deploy it on Vercel</a>
-          then set <code>API_BASE</code> in <code>app.js</code>.
+          <strong>Instagram, TikTok &amp; YouTube work now</strong> — direct oEmbed, no backend needed.<br>
+          <strong>Facebook</strong> requires the backend API.
+          <a href="https://github.com/akmalhalim22/AI-marketing-tools" target="_blank" rel="noopener">Deploy it on Vercel</a>
+          then set <code>API_BASE</code> in <code>app.js</code> to enable Facebook.
         </span>`;
+      banner.className = 'backend-banner info';
       banner.classList.remove('hidden');
     }
     // localhost / custom domain with no API_BASE — stay silent
