@@ -140,7 +140,10 @@ const dom = {
   modalCloseBtn:  $('modal-close-btn'),
 
   // Toast
-  toastContainer: $('toast-container')
+  toastContainer: $('toast-container'),
+
+  // Backend banner
+  backendBanner:  $('backend-banner')
 };
 
 /* ═══════════════════════════════════════════════════════
@@ -467,29 +470,150 @@ function updatePreview(data) {
 }
 
 /* ═══════════════════════════════════════════════════════
-   API CALL — /api/extract
+   API CONFIG
+   ═══════════════════════════════════════════════════════
+   API_BASE: set this to your Vercel deployment URL once deployed.
+   Leave empty ('') to use relative /api/extract (works locally
+   with `node src/server.js` but NOT on GitHub Pages).
+   ═══════════════════════════════════════════════════════ */
+
+const API_BASE = '';   // e.g. 'https://ai-marketing-tools.vercel.app'
+
+/* ═══════════════════════════════════════════════════════
+   DIRECT oEMBED EXTRACTION (no backend needed)
+   Works in-browser for TikTok and YouTube.
+   ═══════════════════════════════════════════════════════ */
+
+async function extractTikTokDirect(url) {
+  const endpoint = `https://www.tiktok.com/oembed?url=${encodeURIComponent(url)}`;
+  const res = await fetch(endpoint);
+  if (!res.ok) throw new Error(`TikTok oEmbed returned ${res.status}`);
+  const d = await res.json();
+  return {
+    version: '1.0',
+    source: { url, platform: 'tiktok', extractor: 'oembed-direct' },
+    clientProfile: {
+      username:    d.author_unique_id || d.author_name || '',
+      profileName: d.author_name || '',
+      profileUrl:  `https://www.tiktok.com/@${d.author_unique_id || ''}`,
+      avatarUrl:   null
+    },
+    postContent: {
+      caption:   d.title || '',
+      hashtags:  (d.title || '').match(/#\w+/g) || [],
+      postType:  'video',
+      timestamp: null
+    },
+    mediaAssets: {
+      videoThumbnail: d.thumbnail_url || null,
+      postImages:     [],
+      carouselAssets: []
+    },
+    engagementMetrics: { likes: null, comments: null, shares: null, views: null },
+    rawOembed: d
+  };
+}
+
+async function extractYouTubeDirect(url) {
+  const endpoint = `https://www.youtube.com/oembed?url=${encodeURIComponent(url)}&format=json`;
+  const res = await fetch(endpoint);
+  if (!res.ok) throw new Error(`YouTube oEmbed returned ${res.status}`);
+  const d = await res.json();
+  // Extract video ID for thumbnail
+  const vidMatch = url.match(/(?:v=|youtu\.be\/)([a-zA-Z0-9_-]{11})/);
+  const videoId = vidMatch ? vidMatch[1] : null;
+  return {
+    version: '1.0',
+    source: { url, platform: 'youtube', extractor: 'oembed-direct' },
+    clientProfile: {
+      username:    d.author_name || '',
+      profileName: d.author_name || '',
+      profileUrl:  d.author_url  || '',
+      avatarUrl:   null
+    },
+    postContent: {
+      caption:   d.title || '',
+      hashtags:  [],
+      postType:  'video',
+      timestamp: null
+    },
+    mediaAssets: {
+      videoThumbnail: videoId ? `https://img.youtube.com/vi/${videoId}/hqdefault.jpg` : null,
+      postImages:     [],
+      carouselAssets: []
+    },
+    engagementMetrics: { likes: null, comments: null, shares: null, views: null },
+    rawOembed: d
+  };
+}
+
+/* ═══════════════════════════════════════════════════════
+   API CALL — /api/extract  (backend required)
    ═══════════════════════════════════════════════════════ */
 
 async function extractPost(url) {
-  log('info', `Calling /api/extract`, { url });
+  const platform = detectPlatformFromUrl(url);
 
-  const response = await fetch('/api/extract', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ url })
-  });
+  // ── Direct extraction (no backend) for supported platforms ────────
+  if (platform === 'tiktok') {
+    log('info', 'Using direct TikTok oEmbed (no backend needed)');
+    return await extractTikTokDirect(url);
+  }
+  if (platform === 'youtube') {
+    log('info', 'Using direct YouTube oEmbed (no backend needed)');
+    return await extractYouTubeDirect(url);
+  }
+
+  // ── All other platforms require the backend ───────────────────────
+  const apiUrl = (API_BASE ? API_BASE.replace(/\/$/, '') : '') + '/api/extract';
+
+  // Detect if we're on GitHub Pages (no backend available)
+  const isGitHubPages = window.location.hostname.endsWith('.github.io');
+  if (isGitHubPages && !API_BASE) {
+    throw new Error(
+      `Instagram and Facebook extraction requires the backend API. ` +
+      `Set API_BASE in app.js to your Vercel URL, or test with a TikTok or YouTube link instead.`
+    );
+  }
+
+  log('info', `Calling ${apiUrl}`, { url, platform });
+
+  let response;
+  try {
+    response = await fetch(apiUrl, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ url })
+    });
+  } catch (networkErr) {
+    // fetch() itself threw — no network, CORS preflight blocked, etc.
+    throw new Error(
+      `Cannot reach the extraction API (${apiUrl}). ` +
+      `Make sure the backend is running or set API_BASE to your Vercel URL.`
+    );
+  }
+
+  // ── Safe JSON parse — guard against HTML error pages ─────────────
+  const contentType = response.headers.get('content-type') || '';
+  if (!contentType.includes('application/json')) {
+    // Server returned HTML (GitHub 404, Vercel error page, etc.)
+    const bodyText = await response.text();
+    const preview  = bodyText.replace(/<[^>]+>/g, '').trim().slice(0, 120);
+    throw new Error(
+      `API returned non-JSON response (${response.status}). ` +
+      `${preview ? `Server said: "${preview}"` : 'Check that the backend is deployed and reachable.'}`
+    );
+  }
 
   const data = await response.json();
 
   if (!response.ok) {
-    log('error', `API returned ${response.status}`, { error: data.error });
-    throw new Error(data.error || `Server error ${response.status}`);
+    throw new Error(data.error || data.message || `Server error ${response.status}`);
   }
 
-  log('success', `API response received (${response.status})`, {
+  log('success', `API response OK (${response.status})`, {
     platform: data?.source?.platform,
-    extractor: data?.source?.extractor,
-    version: data?.version
+    extractor: data?.source?.extractor
   });
 
   return data;
@@ -512,7 +636,9 @@ dom.form.addEventListener('submit', async event => {
   dom.generateBtn.disabled = true;
   dom.btnLabel.classList.add('hidden');
   dom.btnLoading.classList.remove('hidden');
-  setStatus('Connecting to extraction service…', 'loading');
+  const platform = detectPlatformFromUrl(url);
+  const usesDirect = platform === 'tiktok' || platform === 'youtube';
+  setStatus(usesDirect ? 'Fetching via oEmbed…' : 'Connecting to extraction API…', 'loading');
   log('info', 'Extraction started', { url });
 
   try {
@@ -1282,14 +1408,41 @@ function debounce(fn, delay) {
    ═══════════════════════════════════════════════════════ */
 
 async function init() {
+  // ── Backend availability banner ─────────────────────────────────
+  const banner       = $('backend-banner');
+  const isGHPages    = window.location.hostname.endsWith('.github.io');
+  const hasApiBase   = API_BASE.trim() !== '';
+
+  if (banner) {
+    if (hasApiBase) {
+      // Custom backend configured — all platforms available
+      banner.className = 'backend-banner ok';
+      banner.innerHTML = `<i class="fa-solid fa-circle-check"></i>
+        <span>Backend API connected (<code>${API_BASE}</code>). All platforms available.</span>`;
+      banner.classList.remove('hidden');
+    } else if (isGHPages) {
+      // GitHub Pages — no backend, limited to TikTok + YouTube
+      banner.className = 'backend-banner warn';
+      banner.innerHTML = `<i class="fa-solid fa-triangle-exclamation"></i>
+        <span>
+          <strong>TikTok &amp; YouTube work now</strong> (direct oEmbed, no backend needed).<br>
+          <strong>Instagram &amp; Facebook</strong> require the backend API — 
+          <a href="https://github.com/akmalhalim22/AI-marketing-tools" target="_blank" rel="noopener">deploy it on Vercel</a>
+          then set <code>API_BASE</code> in <code>app.js</code>.
+        </span>`;
+      banner.classList.remove('hidden');
+    }
+    // localhost / custom domain with no API_BASE — stay silent
+  }
+
   // Load history badge count on startup
   await refreshHistoryBadge();
 
   // Set initial JSON viewer placeholder
-  renderJson({ status: 'ready', hint: 'Paste a public social post URL above and click Extract.' });
+  renderJson({ status: 'ready', hint: 'Paste a TikTok, YouTube, Instagram or Facebook URL above and click Extract.' });
 
   setStatus('Ready — paste a public social post URL to begin.', 'idle');
-  console.log('[KULT] Social Post JSON Extractor ready.');
+  console.log('[KULT] Social Post JSON Extractor ready.', { isGHPages, hasApiBase });
 }
 
 init();
