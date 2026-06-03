@@ -489,18 +489,67 @@ const API_BASE = '';   // e.g. 'https://ai-marketing-tools.vercel.app'
 async function extractInstagramDirect(url) {
   // Strip tracking params — keep only the shortcode path
   const clean = url.split('?')[0].replace(/\/$/, '');
-  const endpoint = `https://www.instagram.com/api/v1/oembed/?url=${encodeURIComponent(clean)}&omitscript=true`;
+  const igOembed = `https://www.instagram.com/api/v1/oembed/?url=${encodeURIComponent(clean)}&omitscript=true`;
 
-  const res = await fetch(endpoint);
-  if (!res.ok) throw new Error(`Instagram oEmbed returned ${res.status} — the post may be private or deleted.`);
+  // Instagram's oEmbed blocks direct browser fetch() via CORS.
+  // We route through a CORS proxy. Two proxies tried in order:
+  //   1. allorigins.win  — wraps response as { contents: "...json string..." }
+  //   2. codetabs.com    — returns raw JSON directly
+  let d = null;
 
-  const d = await res.json();
+  // ── Proxy 1: allorigins.win ───────────────────────────────────────
+  try {
+    log('info', 'Instagram: trying allorigins proxy…');
+    const res = await fetch(
+      `https://api.allorigins.win/get?url=${encodeURIComponent(igOembed)}`,
+      { signal: AbortSignal.timeout(8000) }
+    );
+    if (res.ok) {
+      const wrapper = await res.json();
+      if (wrapper?.contents) {
+        d = JSON.parse(wrapper.contents);
+        log('info', 'Instagram: allorigins proxy succeeded');
+      }
+    }
+  } catch (e) {
+    log('warn', `Instagram: allorigins proxy failed — ${e.message}`);
+  }
 
-  // Extract hashtags from caption title
+  // ── Proxy 2: codetabs.com (fallback) ─────────────────────────────
+  if (!d) {
+    try {
+      log('info', 'Instagram: trying codetabs proxy…');
+      const res = await fetch(
+        `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(igOembed)}`,
+        { signal: AbortSignal.timeout(8000) }
+      );
+      if (res.ok) {
+        d = await res.json();
+        log('info', 'Instagram: codetabs proxy succeeded');
+      }
+    } catch (e) {
+      log('warn', `Instagram: codetabs proxy failed — ${e.message}`);
+    }
+  }
+
+  if (!d) {
+    throw new Error(
+      'Could not reach Instagram oEmbed (both proxies failed). ' +
+      'Check your internet connection or try again in a moment.'
+    );
+  }
+
+  if (d.error || d.status === 'error') {
+    throw new Error(
+      d.error_message || d.message || 'Instagram returned an error — the post may be private or deleted.'
+    );
+  }
+
+  // Parse caption and extract hashtags
   const caption  = d.title || '';
   const hashtags = [...new Set((caption.match(/#\w+/g) || []))];
 
-  // Derive shortcode from URL for permalink
+  // Derive clean permalink from shortcode
   const shortcodeMatch = url.match(/\/p\/([A-Za-z0-9_-]+)/)  ||
                          url.match(/\/reel\/([A-Za-z0-9_-]+)/) ||
                          url.match(/\/tv\/([A-Za-z0-9_-]+)/);
@@ -509,13 +558,12 @@ async function extractInstagramDirect(url) {
 
   return {
     version: '1.0',
-    source: { url: permalink, platform: 'instagram', extractor: 'oembed-direct' },
+    source: { url: permalink, platform: 'instagram', extractor: 'oembed-proxy' },
     clientProfile: {
       username:    d.author_name || '',
       profileName: d.author_name || '',
       profileUrl:  d.author_url  || `https://www.instagram.com/${d.author_name || ''}`,
-      profileImage: null,
-      avatarUrl:   null
+      profileImage: null
     },
     postContent: {
       caption,
@@ -524,12 +572,13 @@ async function extractInstagramDirect(url) {
       timestamp: null
     },
     mediaAssets: {
-      videoThumbnail: d.thumbnail_url || null,
-      postImages:     d.thumbnail_url ? [{ url: d.thumbnail_url, width: d.thumbnail_width, height: d.thumbnail_height }] : [],
+      videoThumbnail: null,
+      postImages: d.thumbnail_url
+        ? [{ url: d.thumbnail_url, width: d.thumbnail_width || null, height: d.thumbnail_height || null }]
+        : [],
       carouselAssets: []
     },
-    engagementMetrics: { likes: null, comments: null, shares: null, views: null },
-    rawOembed: d
+    engagementMetrics: { likes: null, comments: null, shares: null, views: null }
   };
 }
 
